@@ -1,34 +1,31 @@
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE FlexibleContexts #-}
 
 module Main where
 
-import Data.Monoid ((<>))
-import System.Directory (doesDirectoryExist)
-import System.IO (stdout)
-import Data.List.Split (splitOn)
-import System.Environment (lookupEnv)
-import Control.Applicative
-import qualified Data.ByteString as BS
-import qualified Data.ByteString.Builder as BSB
-import qualified Text.Megaparsec as P
-import Text.Megaparsec.Prim (MonadParsec)
 import qualified Control.Monad as M
 import Control.Monad.Trans.Class (lift)
-import qualified Control.Monad.Tardis as Tardis
-
-type Output = BSB.Builder
-type Parser a = forall s. (P.Stream s Char) => P.ParsecT s (Tardis.TardisT String Output IO) a
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BSC
+import Data.List.Split (splitOn)
+import Lens.Family (view)
+import qualified Pipes as P
+import qualified Pipes.Group as PG
+import qualified Pipes.ByteString as PBS
+import System.Directory (doesDirectoryExist)
+import System.Environment (lookupEnv)
+import qualified Text.Regex.PCRE.Heavy as RE
 
 main :: IO ()
 main = do
-  gopath <- maybe (error "GOPATH not defined") (splitOn (":")) <$> lookupEnv "GOPATH"
-  stdin <- BS.getContents
-  (_, output) <- flip Tardis.execTardisT ("", mempty) $ P.runParserT (gotestformat gopath) "" stdin
-  BSB.hPutBuilder stdout output
+    gopath <- maybe (error "GOPATH not defined") (splitOn (":")) <$> lookupEnv "GOPATH"
+    P.runEffect $ produceLines PBS.stdin P.>-> handleLine gopath P.>-> PBS.stdout
+
+produceLines :: (Monad m) => P.Producer BS.ByteString m r -> P.Producer BS.ByteString m r
+produceLines = PG.folds BS.append BS.empty (`BS.append` "\n") . view PBS.lines
 
 absPath :: [String] -> String -> IO String
 absPath gopath gopackage = do
@@ -37,52 +34,34 @@ absPath gopath gopackage = do
     [x] -> return x
     _ -> return gopackage
 
-parsePath :: MonadParsec s m Char => m String
-parsePath = P.manyTill P.anyChar (P.lookAhead P.spaceChar)
+handleLine :: [String] -> P.Pipe BS.ByteString BS.ByteString IO ()
+handleLine gopath = M.forever $ do
+    line <- P.await
+    if BS.isInfixOf "Location:" line
+        then do
+            (restLines, scanResult) <- takeTill $ maybeRe [RE.re|FAIL\s(.+?)\s|]
+            case scanResult of
+                [(_,[gopackage'])] -> do
+                    abspath <- lift $ absPath gopath $ BSC.unpack gopackage'
+                    let rewriteLocation =
+                            RE.sub
+                            [RE.re|\tLocation:\s(.+)|]
+                            (\[relpath] -> concat [abspath, "/", relpath, ":1"])
+                    M.forM_ (line:restLines) (P.yield . rewriteLocation)        
+                _ -> do
+                    P.yield "(gotestfmt: this section could not be read)\n"
+                    M.forM_ (line:restLines) P.yield
+        else P.yield line
+  where
+    maybeRe r s = case RE.scan r s of
+        [] -> Nothing
+        r' -> Just r'
 
-data Part = Location String | FailLine String
-
-gotestformat :: [String] -> Parser ()
-gotestformat gopath = do
-  M.void $ many $ do
-    found <- P.try $ skipTo $ P.choice
-      [ do
-          P.try $ M.void $ P.string ("\tLocation:\t"::String)
-          Location <$> parsePath
-      , do
-          P.try $ M.void $ P.string "FAIL\t"
-          FailLine <$> parsePath
-      ]
-    case found of 
-      Location filename -> do
-        gopackage <- lift $ Tardis.getFuture
-        write $ concat [ gopackage
-                       , "/"
-                       , filename
-                       , ":1"]
-      FailLine line -> do
-        write $ concat ["FAIL:\t", line, "\n"]
-        path <- lift . lift $ absPath gopath line
-        lift $ Tardis.sendPast path
-  skipTo P.eof
-
-write :: String -> Parser ()
-write = writeb . BSB.string8
-
-writeb :: BSB.Builder -> Parser ()
-writeb b = lift $ Tardis.modifyForwards (<> b)
-
-skipTo :: Parser b -> Parser b
-skipTo p = do
-  (part, end) <- manyTill' (BSB.char8 <$> P.anyChar) p
-  writeb part
-  return end
-
-manyTill' :: (MonadParsec s m t, Monoid b) => m b -> m end -> m (b, end)
-manyTill' p end = P.choice [ (mempty,) <$> end
-                           , do
-                               x <- p
-                               (xs, endVal) <- manyTill' p end
-                               return (x <> xs, endVal)
-                           ]
-
+takeTill :: (Monad m) => (el -> Maybe r) -> P.Consumer' el m ([el], r)
+takeTill p = go []
+  where
+    go els = do
+        el <- P.await
+        case p el of
+            Just r -> return (reverse (el:els), r)
+            _ -> go (el:els)
